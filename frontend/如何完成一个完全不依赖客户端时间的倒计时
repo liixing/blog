@@ -1,0 +1,165 @@
+## 前言
+最近在做一个调查问卷系统，其中有一个需求就是倒计 40 分钟以后自动提交问卷。由于 `UI` 库使用的是 `antd`，所以我第一反应是使用 `antd` 的 `CountDown` 组件。
+于是我就愉快的写出以下代码：
+ 
+```jsx
+import { Statistic } from 'antd';
+const { Countdown } = Statistic;
+
+const TOTAL_TIME = 40;
+const deadline = dayjs(startTime).add(TOTAL_TIME, 'minute').valueOf();
+
+
+function TitleAndCountDown() {
+  useEffect(() => {
+    if (currentTime >= deadline) {
+      onFinish();
+    }
+  }, []);
+
+  return (
+    <Countdown
+      value={deadline}
+      onFinish={onFinish}
+      format="mm:ss"
+      prefix={<img src={clock} style={{ width: 25, height: 25 }} />}
+    />
+  );
+}
+```
+
+其中 `startTime` ，`currentTime` 是服务端给我返回的开始答题时间以及现在的时间，`onFinish` 是提交问卷的函数。测试一切正常，并且看起来好像没有依赖客户端时间，于是我就愉快的提交了代码。
+
+## antd 的问题
+上线后，有客户反映倒计时不正常，进入系统后直接显示 9000 多秒，导致业务直接进行不下去。这个时候我就懵了，我的代码中并没有依赖任何客户端时间，问题肯定是出现在 `antd` 的 `CountDown` 组件上。于是我就去看了一下 `antd` 的 `CountDown` 组件的源码，果不其然
+
+```jsx
+ // 30帧
+ const REFRESH_INTERVAL= 1000 / 30;
+
+  const stopTimer = () => {
+    onFinish?.();
+    if (countdown.current) {
+      clearInterval(countdown.current);
+      countdown.current = null;
+    }
+  };
+
+  const syncTimer = () => {
+    const timestamp = getTime(value);
+    if (timestamp >= Date.now()) {
+      countdown.current = setInterval(() => {
+        forceUpdate();
+        onChange?.(timestamp - Date.now());
+        if (timestamp < Date.now()) {
+          stopTimer();
+        }
+      }, REFRESH_INTERVAL);
+    }
+  };
+
+  React.useEffect(() => {
+    syncTimer();
+    return () => {
+      if (countdown.current) {
+        clearInterval(countdown.current);
+        countdown.current = null;
+      }
+    };
+  }, [value]);
+```
+核心代码就是这段，本质 `CountDown` 并不是一个倒计时，而是根据客户端时间算出来的一个时间差值，这也能解释为啥这个倒计时相对比较准确。
+
+但是依赖了客户端时间，就意味客户的本地时间会影响这个倒计时的准确性，甚至可以直接通过修改本地时间来绕过倒计时。一开始我的方案是加入 `diff` 值修正客户端时间，我也给 `antd` 官方提了一个 [PR](https://github.com/ant-design/ant-design/pull/41918)，但是被拒绝了。后来想了一下 `CountDown` 组件可以直接传入 `diff` 后的 `value`，确实没有必要新增 `props`。
+
+这个方案后来也是被否了，因为还是依赖了客户端时间。客户的机房条件比较复杂，可能一开始时间不对，但是做题途中时间会校正回来。因为我们这个调查系统短时间有几十万人参加调查，为了不给服务器过多的压力，查询服务器时间接口的频率是 1 分钟一次，所以会有很长时间的倒计时异常。
+
+## 完全不依赖客户端时间的倒计时
+
+倒计时的方案大致有 4 种， `setTimeout`，`setInterval`，`requestAnimationFrame`，`Web Worker` 。`requestAnimationFrame` 和 `Web Worker` 因为兼容性问题暂时放弃。
+
+`setInterval` 实现倒计时是比较方便的，但是 `setInterval` 有两个缺点
+
+1. 使用 setInterval 时，某些间隔会被跳过；
+2. 可能多个定时器会连续执行；
+
+每个 `setTimeout` 产生的任务会直接 `push` 到任务队列中；而 `setInterval` 在每次把任务push到任务队列前，都要进行一下判断(看上次的任务是否仍在队列中)。
+
+可以看到，主线程的渲染都会对 `setTimeout` 和 `setInterval` 的执行时间产生影响，但是 `setTimeout` 的影响小一点。所以我们可以使用 `setTimeout` 来实现倒计时.
+
+```tsx
+const INTERVAL = 1000;
+
+interface CountDownProps {
+  restTime: number;
+  format?: string;
+  onFinish: () => void;
+  key: number;
+}
+export const CountDown = ({ restTime, format = 'mm:ss', onFinish }: CountDownProps) => {
+  const timer = useRef<NodeJS.Timer | null>(null);
+  const [remainingTime, setRemainingTime] = useState(restTime);
+
+  useEffect(() => {
+    if (remainingTime < 0 && timer.current) {
+      onFinish?.();
+      clearTimeout(timer.current);
+      timer.current = null;
+      return;
+    }
+    timer.current = setTimeout(() => {
+      setRemainingTime((time) => time - INTERVAL);
+    }, INTERVAL);
+    return () => {
+      if (timer.current) {
+        clearTimeout(timer.current);
+        timer.current = null;
+      }
+    };
+  }, [remainingTime]);
+
+  return <span>{dayjs(remainingTime > 0 ? remainingTime : 0).format(format)}</span>;
+};
+```
+
+为了修正 `setTimeout` 的时间误差,我们需要在 `聚焦页面的时候` 以及 `定时一分钟`请求一次服务器时间来修正误差。这里我们使用 `swr` 来轻松实现这个功能。
+
+```jsx
+const REFRESH_INTERVAL = 60 * 1000;
+
+export function useServerTime() {
+  const { data } = useSWR('/api/getCurrentTime', swrFetcher, {
+    // revalidateOnFocus 默认是开启的，但是我们项目中给关了，所以需要重新激活
+    revalidateOnFocus: true,
+    refreshInterval: REFRESH_INTERVAL,
+  });
+  return { currentTime: data?.currentTime };
+}
+```
+
+最后我们把 `CountDown` 组件和 `useServerTime` 结合起来
+
+```jsx
+function TitleAndCountDown() {
+  const { currentTime } = useServerTime();
+
+  return (
+    <Countdown
+      restTime={deadline - currentTime}
+      onFinish={onFinish}
+      key={deadline - currentTime}
+    />
+  );
+}
+```
+这样，就完成了一个完全不依赖客户端时间的倒计时组件。
+
+## 总结
+
+- 上面方案中的 `setTimeout` 其实换成 `requestAnimationFrame` 计时会更加准确，也解决了 `requestAnimationFrame` 在 `未被激活的页面中` 中不会执行的问题。
+- `setInterval` 和 `setTimeout` 的时间误差是由于主线程的渲染时间造成的，所以如果我们的页面中有很多的动画，那么这个误差会更大。
+- 未激活的页面，`setTimeout` 的最小执行间隔是 `1000ms`
+
+
+
+
